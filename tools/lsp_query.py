@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from typing import Any, Dict
 
 
@@ -38,6 +39,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("query", help="workspace/symbol query string (fixed-string grep)")
     ap.add_argument("--definition", action="store_true", help="also send textDocument/definition at a dummy position")
+    ap.add_argument("--cancel", action="store_true", help="send $/cancelRequest for the workspace/symbol request")
     ap.add_argument("--files", nargs="*", default=None, help="restrict server search to these files")
     ap.add_argument("--trace", action="store_true", help="enable server trace (sets SLCLANGD_TRACE=1)")
     args = ap.parse_args()
@@ -56,6 +58,9 @@ def main() -> int:
     env = os.environ.copy()
     if args.trace:
         env["SLCLANGD_TRACE"] = "1"
+    if args.cancel:
+        # Make grep slow enough that cancellation is observable.
+        env["SLCLANGD_GREP_DELAY_MS"] = env.get("SLCLANGD_GREP_DELAY_MS", "25")
 
     proc = subprocess.Popen(
         cmd,
@@ -82,6 +87,10 @@ def main() -> int:
         send(proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
         send(proc, {"jsonrpc": "2.0", "id": 2, "method": "workspace/symbol", "params": {"query": args.query}})
+        if args.cancel:
+            # Give the server a moment to start grep, then cancel.
+            time.sleep(0.01)
+            send(proc, {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 2}})
         r2 = recv(proc)
         print("workspace/symbol response:", json.dumps(r2, indent=2))
 

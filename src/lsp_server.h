@@ -1,8 +1,12 @@
 #pragma once
 
+#include <atomic>
+#include <memory>
+#include <mutex>
 #include <ostream>
 #include <string>
 #include <unordered_map>
+#include <sys/types.h>
 #include <vector>
 
 #include "lsp_transport.h"
@@ -34,10 +38,18 @@ class Server final {
   void onDidChange(const nlohmann::json& params);
   void onDidClose(const nlohmann::json& params);
 
-  nlohmann::json onWorkspaceSymbol(const nlohmann::json& params);
-  nlohmann::json onHover(const nlohmann::json& params);
-  nlohmann::json onDefinition(const nlohmann::json& params);
-  nlohmann::json onReferences(const nlohmann::json& params);
+  nlohmann::json onWorkspaceSymbol(const nlohmann::json& params,
+                                   std::atomic_bool* cancelled,
+                                   std::atomic<pid_t>* child_pid);
+  nlohmann::json onHover(const nlohmann::json& params,
+                         std::atomic_bool* cancelled,
+                         std::atomic<pid_t>* child_pid);
+  nlohmann::json onDefinition(const nlohmann::json& params,
+                              std::atomic_bool* cancelled,
+                              std::atomic<pid_t>* child_pid);
+  nlohmann::json onReferences(const nlohmann::json& params,
+                              std::atomic_bool* cancelled,
+                              std::atomic<pid_t>* child_pid);
 
   void replyResult(const nlohmann::json& id, const nlohmann::json& result);
   void replyError(const nlohmann::json& id, int code, const std::string& message);
@@ -51,6 +63,14 @@ class Server final {
   bool exit_requested_ = false;
   bool trace_ = false;
   bool clangd_file_status_ = false;
+
+  struct InFlight {
+    std::atomic_bool cancelled{false};
+    std::atomic<pid_t> grep_pid{-1};
+  };
+  std::mutex inflight_mu_;
+  std::unordered_map<std::string, std::shared_ptr<InFlight>> inflight_;
+  std::mutex send_mu_;
 
   std::string root_uri_;
   std::string root_path_;

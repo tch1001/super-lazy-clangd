@@ -1,13 +1,16 @@
 #include "grep_search.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <csignal>
+#include <chrono>
 #include <cstring>
 #include <sstream>
 #include <string>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -66,7 +69,9 @@ static void closeIfValid(int fd) {
 
 static std::vector<GrepMatch> runGrep(const std::vector<std::string>& args_str,
                                       const std::string& needle,
-                                      int max_results) {
+                                      int max_results,
+                                      std::atomic_bool* cancelled,
+                                      std::atomic<pid_t>* child_pid) {
   std::vector<GrepMatch> out;
   if (needle.empty() || max_results <= 0) return out;
 
@@ -99,6 +104,7 @@ static std::vector<GrepMatch> runGrep(const std::vector<std::string>& args_str,
   }
 
   // parent
+  if (child_pid) child_pid->store(pid, std::memory_order_release);
   closeIfValid(pipefd[1]);
   FILE* f = fdopen(pipefd[0], "r");
   if (!f) {
@@ -111,7 +117,22 @@ static std::vector<GrepMatch> runGrep(const std::vector<std::string>& args_str,
   char* lineptr = nullptr;
   size_t n = 0;
   int collected = 0;
+  int delay_ms = 0;
+  if (const char* d = std::getenv("SLCLANGD_GREP_DELAY_MS")) {
+    try {
+      delay_ms = std::stoi(d);
+    } catch (...) {
+      delay_ms = 0;
+    }
+  }
   while (true) {
+    if (cancelled && cancelled->load(std::memory_order_acquire)) {
+      (void)kill(pid, SIGTERM);
+      break;
+    }
+    if (delay_ms > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+    }
     errno = 0;
     ssize_t r = getline(&lineptr, &n, f);
     if (r <= 0) break;
@@ -156,7 +177,9 @@ static std::vector<GrepMatch> runGrep(const std::vector<std::string>& args_str,
 std::vector<GrepMatch> grepFixedString(const std::string& root_dir,
                                        const std::string& needle,
                                        int max_results,
-                                       std::optional<std::string> only_extensions) {
+                                       std::optional<std::string> only_extensions,
+                                       std::atomic_bool* cancelled,
+                                       std::atomic<pid_t>* child_pid) {
   std::vector<std::string> args_str;
   args_str.push_back("grep");
   args_str.push_back("-RIn");          // recursive, line numbers
@@ -182,12 +205,14 @@ std::vector<GrepMatch> grepFixedString(const std::string& root_dir,
   args_str.push_back(needle);
   args_str.push_back(root_dir);
 
-  return runGrep(args_str, needle, max_results);
+  return runGrep(args_str, needle, max_results, cancelled, child_pid);
 }
 
 std::vector<GrepMatch> grepFixedStringInFiles(const std::vector<std::string>& files,
                                               const std::string& needle,
-                                              int max_results) {
+                                              int max_results,
+                                              std::atomic_bool* cancelled,
+                                              std::atomic<pid_t>* child_pid) {
   if (files.empty()) return {};
 
   std::vector<std::string> args_str;
@@ -200,7 +225,7 @@ std::vector<GrepMatch> grepFixedStringInFiles(const std::vector<std::string>& fi
   args_str.push_back(needle);
   for (const auto& f : files) args_str.push_back(f);
 
-  return runGrep(args_str, needle, max_results);
+  return runGrep(args_str, needle, max_results, cancelled, child_pid);
 }
 
 }  // namespace slclangd
