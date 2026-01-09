@@ -1,0 +1,10 @@
+build*/
+.cache/
+.clangd/
+compile_commands.json
+*.o
+*.obj
+*.exe
+*.out
+
+
