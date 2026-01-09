@@ -68,7 +68,8 @@ def main() -> int:
     send(proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
     # Query should hit src/lsp_server.cpp (we restricted search via --files).
-    send(proc, {"jsonrpc": "2.0", "id": 2, "method": "workspace/symbol", "params": {"query": "workspace/symbol"}})
+    # Use a token that appears in code, not inside string literals.
+    send(proc, {"jsonrpc": "2.0", "id": 2, "method": "workspace/symbol", "params": {"query": "Server::"}})
     resp2 = recv(proc)
     assert resp2.get("id") == 2, resp2
     assert isinstance(resp2.get("result"), list), resp2

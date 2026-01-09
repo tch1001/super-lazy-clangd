@@ -1,6 +1,7 @@
 #include "grep_search.h"
 
 #include <cerrno>
+#include <cctype>
 #include <csignal>
 #include <cstring>
 #include <sstream>
@@ -26,9 +27,37 @@ static bool splitFirstTwoColons(const std::string& s, std::string& a, std::strin
 
 static int findColumn0(const std::string& haystack, const std::string& needle) {
   if (needle.empty()) return 0;
-  auto pos = haystack.find(needle);
-  if (pos == std::string::npos) return 0;
-  return static_cast<int>(pos);
+
+  // Filter comment-only lines: first two non-space characters are "//".
+  std::size_t i = 0;
+  while (i < haystack.size() && std::isspace(static_cast<unsigned char>(haystack[i]))) ++i;
+  if (i + 1 < haystack.size() && haystack[i] == '/' && haystack[i + 1] == '/') return -1;
+
+  // Find the first occurrence of needle that is NOT inside double quotes.
+  // (Very lightweight heuristic: handles \" escaping, doesn't parse C++ fully.)
+  auto is_escaped_quote = [&](std::size_t pos) -> bool {
+    // Count backslashes directly preceding pos.
+    std::size_t bs = 0;
+    while (pos > 0 && haystack[pos - 1] == '\\') {
+      ++bs;
+      --pos;
+    }
+    return (bs % 2) == 1;
+  };
+
+  std::size_t search_from = 0;
+  while (true) {
+    std::size_t pos = haystack.find(needle, search_from);
+    if (pos == std::string::npos) return -1;
+
+    bool in_string = false;
+    for (std::size_t j = 0; j < pos; ++j) {
+      if (haystack[j] == '"' && !is_escaped_quote(j)) in_string = !in_string;
+    }
+    if (!in_string) return static_cast<int>(pos);
+
+    search_from = pos + 1;
+  }
 }
 
 static void closeIfValid(int fd) {
@@ -105,6 +134,9 @@ static std::vector<GrepMatch> runGrep(const std::vector<std::string>& args_str,
     m.line = line_no;
     m.text = text;
     m.column = findColumn0(text, needle);
+    if (m.column < 0) {
+      continue;  // filtered out (comment-only line or match only in quotes)
+    }
     out.push_back(std::move(m));
     if (++collected >= max_results) {
       (void)kill(pid, SIGTERM);
