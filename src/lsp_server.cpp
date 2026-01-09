@@ -5,9 +5,10 @@
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
+#include <optional>
 #include <string_view>
 #include <unordered_set>
-#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -124,6 +125,154 @@ static bool isStopWord(std::string_view sym) {
       "wchar_t",   "while",
   };
   return kStop.find(lower) != kStop.end();
+}
+
+struct MatchRank {
+  GrepMatch m;
+  int score = 0;
+  std::string abs_path;
+};
+
+static bool isWsOrBolBefore(const std::string& line, int col0) {
+  if (col0 <= 0) return true;
+  char c = line[static_cast<std::size_t>(col0 - 1)];
+  return c == ' ' || c == '\t';
+}
+
+static std::optional<int> macroNameStartIfDefine(const std::string& line) {
+  std::size_t i = 0;
+  while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i]))) ++i;
+  if (i >= line.size() || line[i] != '#') return std::nullopt;
+  ++i;
+  while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i]))) ++i;
+  constexpr std::string_view kDefine = "define";
+  if (i + kDefine.size() > line.size()) return std::nullopt;
+  if (std::string_view(line).substr(i, kDefine.size()) != kDefine) return std::nullopt;
+  i += kDefine.size();
+  if (i < line.size() && !std::isspace(static_cast<unsigned char>(line[i]))) return std::nullopt;
+  while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i]))) ++i;
+  if (i >= line.size()) return std::nullopt;
+  return static_cast<int>(i);
+}
+
+static int scoreMatchLine(const std::string& line, int col0, std::string_view needle) {
+  if (col0 < 0) return -100000;
+  int score = 0;
+
+  auto prevNonSpace = [&](int before) -> char {
+    int k = before;
+    while (k > 0) {
+      char c = line[static_cast<std::size_t>(k - 1)];
+      if (c != ' ' && c != '\t') return c;
+      --k;
+    }
+    return '\0';
+  };
+
+  auto prevIdentifier = [&](int before) -> std::string {
+    // Walk left: skip whitespace, then common punctuation, then collect identifier.
+    int k = before;
+    while (k > 0 && (line[static_cast<std::size_t>(k - 1)] == ' ' || line[static_cast<std::size_t>(k - 1)] == '\t')) --k;
+    while (k > 0) {
+      char c = line[static_cast<std::size_t>(k - 1)];
+      if (c == '*' || c == '&' || c == ':' || c == '<' || c == '>' || c == ',' || c == '(') {
+        --k;
+        continue;
+      }
+      break;
+    }
+    while (k > 0 && (line[static_cast<std::size_t>(k - 1)] == ' ' || line[static_cast<std::size_t>(k - 1)] == '\t')) --k;
+
+    int end = k;
+    while (k > 0) {
+      unsigned char uc = static_cast<unsigned char>(line[static_cast<std::size_t>(k - 1)]);
+      if (std::isalnum(uc) || uc == '_') {
+        --k;
+        continue;
+      }
+      break;
+    }
+    if (end <= k) return {};
+    std::string tok = line.substr(static_cast<std::size_t>(k), static_cast<std::size_t>(end - k));
+    for (auto& ch : tok) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return tok;
+  };
+
+  // Strong signal: macro definition (#define <needle> ...)
+  if (auto macro_start = macroNameStartIfDefine(line)) {
+    if (*macro_start == col0) score += 100;
+  }
+
+  // Boundary before token indicates likely declaration/definition site.
+  if (isWsOrBolBefore(line, col0)) score += 25;
+
+  // Template-ish / qualified type-ish: previous non-space is '>' (e.g. vector<T> foo(...))
+  if (prevNonSpace(col0) == '>') score += 20;
+
+  int end = col0 + static_cast<int>(needle.size());
+  if (end < 0) end = 0;
+  if (end > static_cast<int>(line.size())) end = static_cast<int>(line.size());
+
+  // Lookahead after token.
+  // - immediate ';' after token: very likely a declaration (e.g. "int foo;")
+  if (end < static_cast<int>(line.size()) && line[static_cast<std::size_t>(end)] == ';') score += 40;
+
+  // - next non-space is '(' : function-like (decl/def/call), still a good signal.
+  std::size_t j = static_cast<std::size_t>(end);
+  while (j < line.size() && (line[j] == ' ' || line[j] == '\t')) ++j;
+  if (j < line.size() && line[j] == '(') score += 60;
+
+  // If it's function-like and preceded by a primitive return type, boost more.
+  // Heuristic examples: "int foo(", "void bar(", "unsigned long baz(".
+  if (j < line.size() && line[j] == '(') {
+    std::string prev = prevIdentifier(col0);
+    static const std::unordered_set<std::string> kPrim = {
+        "void", "bool", "char", "short", "int", "long", "float", "double",
+        "signed", "unsigned",
+        "wchar_t", "char8_t", "char16_t", "char32_t",
+        "size_t", "ssize_t",
+        "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t",
+        "intptr_t", "uintptr_t",
+        // Common kernel typedefs
+        "u8", "u16", "u32", "u64",
+        "s8", "s16", "s32", "s64",
+    };
+    if (!prev.empty() && kPrim.find(prev) != kPrim.end()) score += 30;
+  }
+
+  return score;
+}
+
+static std::vector<MatchRank> rankAndFilterMatches(const std::vector<GrepMatch>& matches,
+                                                   std::string_view needle,
+                                                   const std::string& current_abs_path,
+                                                   int current_line1,
+                                                   const std::string& prefer_abs_path,
+                                                   const std::function<std::string(const std::string&)>& make_abs) {
+  std::vector<MatchRank> out;
+  out.reserve(matches.size());
+  for (const auto& m : matches) {
+    MatchRank r;
+    r.m = m;
+    r.abs_path = make_abs(m.path);
+    if (!current_abs_path.empty() && current_line1 > 0) {
+      if (r.abs_path == current_abs_path && m.line == current_line1) {
+        continue;  // ignore exact same line; user is already there
+      }
+    }
+    r.score = scoreMatchLine(m.text, m.column, needle);
+    // Prefer matches in the same file as the query (useful for references),
+    // but do not outrank real "definition-like" signals.
+    if (!prefer_abs_path.empty() && r.abs_path == prefer_abs_path) r.score += 10;
+    out.push_back(std::move(r));
+  }
+  std::stable_sort(out.begin(), out.end(), [](const MatchRank& a, const MatchRank& b) {
+    if (a.score != b.score) return a.score > b.score;
+    if (a.abs_path != b.abs_path) return a.abs_path < b.abs_path;
+    if (a.m.line != b.m.line) return a.m.line < b.m.line;
+    return a.m.column < b.m.column;
+  });
+  return out;
 }
 
 static json nullResult() { return nullptr; }
@@ -430,9 +579,15 @@ json Server::onWorkspaceSymbol(const json& params, std::atomic_bool* cancelled, 
     matches = grepFixedString(rootDir(), query, 50, std::string("c,cc,cpp,cxx,h,hh,hpp,hxx"), cancelled, child_pid);
   }
 
+  // Rank likely declarations/definitions/macros higher.
+  auto ranked =
+      rankAndFilterMatches(matches, query, /*current_abs_path=*/"", /*current_line1=*/0, /*prefer_abs_path=*/"",
+                           [this](const std::string& p) { return makeResultPathAbsolute(p); });
+
   json arr = json::array();
-  for (const auto& m : matches) {
-    std::string abs = makeResultPathAbsolute(m.path);
+  for (const auto& r : ranked) {
+    const auto& m = r.m;
+    const std::string& abs = r.abs_path;
     json loc;
     loc["uri"] = pathToFileUri(abs);
     loc["range"] = json{
@@ -464,17 +619,23 @@ json Server::onHover(const json& params, std::atomic_bool* cancelled, std::atomi
   if (isInLineCommentAt(it->second.text, line0, ch0)) return nullResult();
   std::string sym = wordAt(it->second.text, line0, ch0);
   if (isStopWord(sym)) return nullResult();
+  std::string current_abs = makeResultPathAbsolute(fileUriToPath(uri));
+  int current_line1 = line0 + 1;
 
   std::vector<GrepMatch> matches;
   if (!serve_files_.empty()) {
-    matches = grepFixedStringInFiles(serve_files_, sym, 1, cancelled, child_pid);
+    matches = grepFixedStringInFiles(serve_files_, sym, 20, cancelled, child_pid);
   } else {
-    matches = grepFixedString(rootDir(), sym, 1, std::string("c,cc,cpp,cxx,h,hh,hpp,hxx"), cancelled, child_pid);
+    matches = grepFixedString(rootDir(), sym, 20, std::string("c,cc,cpp,cxx,h,hh,hpp,hxx"), cancelled, child_pid);
   }
   if (matches.empty()) return nullResult();
 
-  const auto& m = matches.front();
-  std::string abs = makeResultPathAbsolute(m.path);
+  auto ranked = rankAndFilterMatches(matches, sym, current_abs, current_line1, /*prefer_abs_path=*/current_abs,
+                                     [this](const std::string& p) { return makeResultPathAbsolute(p); });
+  if (ranked.empty()) return nullResult();
+  const auto& best = ranked.front();
+  const auto& m = best.m;
+  const std::string& abs = best.abs_path;
   json hover;
   hover["contents"] = json{
       {"kind", "markdown"},
@@ -502,6 +663,8 @@ json Server::onDefinition(const json& params, std::atomic_bool* cancelled, std::
   if (isInLineCommentAt(it->second.text, line0, ch0)) return nullResult();
   std::string sym = wordAt(it->second.text, line0, ch0);
   if (isStopWord(sym)) return nullResult();
+  std::string current_abs = makeResultPathAbsolute(fileUriToPath(uri));
+  int current_line1 = line0 + 1;
 
   std::vector<GrepMatch> matches;
   if (!serve_files_.empty()) {
@@ -511,9 +674,40 @@ json Server::onDefinition(const json& params, std::atomic_bool* cancelled, std::
   }
   if (matches.empty()) return nullResult();
 
+  auto ranked = rankAndFilterMatches(matches, sym, current_abs, current_line1, /*prefer_abs_path=*/current_abs,
+                                     [this](const std::string& p) { return makeResultPathAbsolute(p); });
+  if (ranked.empty()) return nullResult();
+
+  // If there's exactly one "strong" definition-like hit, return only it.
+  // (VSCode will then jump directly instead of showing a chooser.)
+  int strong = 0;
+  std::size_t strong_idx = 0;
+  for (std::size_t i = 0; i < ranked.size(); ++i) {
+    if (ranked[i].score >= 60) {
+      strong++;
+      strong_idx = i;
+      if (strong > 1) break;
+    }
+  }
+
   json locs = json::array();
-  for (const auto& m : matches) {
-    std::string abs = makeResultPathAbsolute(m.path);
+  if (strong == 1) {
+    const auto& r = ranked[strong_idx];
+    const auto& m = r.m;
+    const std::string& abs = r.abs_path;
+    json loc;
+    loc["uri"] = pathToFileUri(abs);
+    loc["range"] = json{
+        {"start", json{{"line", m.line - 1}, {"character", m.column}}},
+        {"end", json{{"line", m.line - 1}, {"character", m.column + static_cast<int>(sym.size())}}},
+    };
+    locs.push_back(std::move(loc));
+    return locs;
+  }
+
+  for (const auto& r : ranked) {
+    const auto& m = r.m;
+    const std::string& abs = r.abs_path;
     json loc;
     loc["uri"] = pathToFileUri(abs);
     loc["range"] = json{
@@ -539,6 +733,8 @@ json Server::onReferences(const json& params, std::atomic_bool* cancelled, std::
   if (isInLineCommentAt(it->second.text, line0, ch0)) return json::array();
   std::string sym = wordAt(it->second.text, line0, ch0);
   if (isStopWord(sym)) return json::array();
+  std::string current_abs = makeResultPathAbsolute(fileUriToPath(uri));
+  int current_line1 = line0 + 1;
 
   std::vector<GrepMatch> matches;
   if (!serve_files_.empty()) {
@@ -547,9 +743,12 @@ json Server::onReferences(const json& params, std::atomic_bool* cancelled, std::
     matches = grepFixedString(rootDir(), sym, 50, std::string("c,cc,cpp,cxx,h,hh,hpp,hxx"), cancelled, child_pid);
   }
 
+  auto ranked = rankAndFilterMatches(matches, sym, current_abs, current_line1, /*prefer_abs_path=*/current_abs,
+                                     [this](const std::string& p) { return makeResultPathAbsolute(p); });
   json locs = json::array();
-  for (const auto& m : matches) {
-    std::string abs = makeResultPathAbsolute(m.path);
+  for (const auto& r : ranked) {
+    const auto& m = r.m;
+    const std::string& abs = r.abs_path;
     json loc;
     loc["uri"] = pathToFileUri(abs);
     loc["range"] = json{
